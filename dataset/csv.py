@@ -10,6 +10,33 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 from dataset.transform import random_rot_flip, random_rotate, blur, obtain_cutmix_box
+from scipy.ndimage import gaussian_filter, map_coordinates
+import cv2
+
+
+def elastic_transform(image, mask, alpha=30, sigma=5):
+    """弹性形变，模拟不同扫描角度下的斑块形态"""
+    random_state = np.random.RandomState(None)
+    shape = image.shape
+
+    dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
+    dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma) * alpha
+
+    x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+    indices = np.reshape(y + dy, (-1, 1)), np.reshape(x + dx, (-1, 1))
+
+    image_t = map_coordinates(image, indices, order=1, mode='reflect').reshape(shape)
+    mask_t = map_coordinates(mask, indices, order=0, mode='reflect').reshape(shape)
+
+    return image_t, mask_t
+
+
+def adaptive_histogram_equalization(image):
+    """CLAHE 对比度增强，突出斑块边界"""
+    image_uint8 = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(image_uint8)
+    return enhanced.astype(np.float32) / 255.0
 
 
 class CSVSemiDataset(Dataset):
@@ -84,6 +111,18 @@ class CSVSemiDataset(Dataset):
             image_h5_file, label_h5_file = case['image'], case['label']
             long_img, trans_img = self._read_pair(image_h5_file)
             long_mask, trans_mask, cls = self._read_label(label_h5_file)
+
+            # === 新增：对比度增强（50%概率） ===
+            if random.random() > 0.5:
+                long_img = adaptive_histogram_equalization(long_img)
+            if random.random() > 0.5:
+                trans_img = adaptive_histogram_equalization(trans_img)
+
+            # === 新增：弹性形变（30%概率，针对斑块类） ===
+            if random.random() > 0.7:
+                long_img, long_mask = elastic_transform(long_img, long_mask, alpha=30, sigma=5)
+            if random.random() > 0.7:
+                trans_img, trans_mask = elastic_transform(trans_img, trans_mask, alpha=30, sigma=5)
 
             # Apply same-type augmentation to long/trans (each can be independently random)
             if random.random() > 0.5:

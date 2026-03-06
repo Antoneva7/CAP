@@ -2,6 +2,7 @@ import numpy as np
 from torch import nn
 import torch
 from scipy.ndimage import binary_erosion, distance_transform_edt
+import torch.nn.functional as F
 
 def compute_nsd(pred, gt, tolerance=1.0):
     """
@@ -111,3 +112,59 @@ class AverageMeter(object):
             self.sum += val * num
             self.count += num
             self.avg = self.sum / self.count
+
+
+class BoundaryLoss(nn.Module):
+    """关注边界区域的损失 - 使用平均池化实现"""
+
+    def __init__(self, theta=2):
+        super().__init__()
+        self.theta = theta  # 边界膨胀半径
+
+    def _get_boundary(self, target_onehot):
+        """
+        提取每个类别的边界区域
+        target_onehot: [B, C, H, W] one-hot编码的目标
+        """
+        kernel_size = self.theta * 2 + 1
+        padding = self.theta
+
+        # 使用最大池化模拟膨胀操作（更简单，不需要处理通道问题）
+        # 最大池化会自动处理多通道输入
+        dilated = F.max_pool2d(target_onehot, kernel_size, stride=1, padding=padding)
+
+        # 边界 = 膨胀区域 - 原始区域
+        boundary = dilated - target_onehot
+        return boundary
+
+    def forward(self, pred, target):
+        # pred: [B, C, H, W] (logits), target: [B, H, W]
+
+        # 提取边界（使用形态学操作）
+        target_onehot = F.one_hot(target, num_classes=pred.size(1)).permute(0, 3, 1, 2).float()
+
+        # 获取边界区域
+        boundary = self._get_boundary(target_onehot)
+
+        # 边界权重：边界区域权重为2，非边界区域权重为1
+        boundary_weight = 1.0 + boundary
+
+        # 使用softmax获取概率
+        pred_soft = F.softmax(pred, dim=1)
+
+        # 计算加权Dice Loss
+        smooth = 1e-5
+
+        # 分子：加权后的交集
+        intersection = (pred_soft * target_onehot * boundary_weight).sum(dim=(2, 3))
+
+        # 分母：加权后的总和
+        denominator = ((pred_soft + target_onehot) * boundary_weight).sum(dim=(2, 3))
+
+        # 计算每个类别的dice系数
+        dice = (2 * intersection + smooth) / (denominator + smooth)
+
+        # 对类别取平均
+        loss = 1 - dice.mean()
+
+        return loss

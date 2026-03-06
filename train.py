@@ -18,8 +18,8 @@ from dataset.csv import CSVSemiDataset
 from util.utils import AverageMeter, count_params, DiceLoss, compute_nsd
 
 from model.Echocare import Echocare_UniMatch
-from model.unet import UNetTwoView
-
+from model.echocare_optimized import OptimizedEchocare_UniMatch
+from model.convnext import ConvNeXt_UniMatch
 
 def main():
     parser = argparse.ArgumentParser("UniMatch Two-View Training")
@@ -36,12 +36,17 @@ def main():
     parser.add_argument("--resize_target", type=int, default=256)
 
     parser.add_argument("--echo_care_ckpt", type=str, default="./pretrain/echocare_encoder.pth")
+    parser.add_argument("--convnext_ckpt", type=str, default="./pretrain/convnext_tiny_22k_1k_224.pth",
+                        help="Path to ConvNeXt pretrained weights")
     parser.add_argument('--amp', type=bool, default=True, help='enable torch.cuda.amp')
     parser.add_argument('--amp-dtype', type=str, default='fp16', choices=['fp16', 'bf16'])
 
     # model choice: Echocare (SwinUNETR-based) or UNet
-    parser.add_argument("--model", type=str, default="Echocare", choices=["Echocare", "UNet"],
-                        help="Model architecture to use: 'Echocare' or 'UNet'")
+    # parser.add_argument("--model", type=str, default="Echocare", choices=["Echocare", "UNet"],
+    #                     help="Model architecture to use: 'Echocare' or 'UNet'")
+    parser.add_argument("--model", type=str, default="Echocare",
+                        choices=["Echocare", "UNet", "ConvNeXt","SwinUNet"],  # 新增 ConvNeXt
+                        help="Model architecture to use: 'Echocare', 'UNet', 'ConvNeXt', 'SwinUNet'")
 
     parser.add_argument("--save_path", type=str, default="./checkpoints")
     parser.add_argument("--gpu", type=str, default="3")
@@ -253,11 +258,35 @@ def train_one_epoch(
     scaler
 ):
     model.train()
+
+    # ============= 改动点4：动态控制分类梯度回传 =============
+    # 前20个epoch分类梯度不回传到编码器（专注于分割）
+    # 20个epoch后允许分类梯度更新编码器
+    if hasattr(model, 'set_cls_detach'):
+        if epoch < 20:
+            model.set_cls_detach(True)
+            if epoch == 0:
+                logger.info("Classification gradients detached from encoder (focus on segmentation)")
+        else:
+            model.set_cls_detach(False)
+            if epoch == 20:
+                logger.info("Classification gradients now updating encoder (joint optimization)")
     
     criterion_cls = nn.BCEWithLogitsLoss()
     criterion_cls_mse = nn.MSELoss()
-    criterion_seg_ce = nn.CrossEntropyLoss()
+
+    # 【修改点 1：方案二 - 加权 CE Loss】
+    # 0:背景(0.1), 1:斑块(5.0), 2:血管(1.0) -> 重点关注斑块
+    class_weights = torch.tensor([0.1, 5.0, 1.0]).to(device)
+    criterion_seg_ce = nn.CrossEntropyLoss(weight=class_weights)
+
+    from util.utils import BoundaryLoss
+    criterion_boundary = BoundaryLoss()
+
     criterion_seg_dice = DiceLoss(n_classes=args.seg_num_classes)
+
+    # criterion_seg_ce = nn.CrossEntropyLoss()
+    # criterion_seg_dice = DiceLoss(n_classes=args.seg_num_classes)
 
     total_loss = AverageMeter()
     total_loss_x = AverageMeter()
@@ -351,10 +380,22 @@ def train_one_epoch(
 
             # 6) losses
             # labeled seg loss: long + trans average
-            loss_x_long = (criterion_seg_ce(segL_x, m_long) +
-                        criterion_seg_dice(segL_x, m_long, softmax=True, ignore=torch.zeros_like(m_long))) / 2.0
-            loss_x_trans = (criterion_seg_ce(segT_x, m_trans) +
-                            criterion_seg_dice(segT_x, m_trans, softmax=True, ignore=torch.zeros_like(m_trans))) / 2.0
+            # loss_x_long = (criterion_seg_ce(segL_x, m_long) +
+            #             criterion_seg_dice(segL_x, m_long, softmax=True, ignore=torch.zeros_like(m_long))) / 2.0
+            loss_x_long = (
+                    criterion_seg_ce(segL_x, m_long) +
+                    criterion_seg_dice(segL_x, m_long, softmax=True, ignore=torch.zeros_like(m_long)) +
+                    criterion_boundary(segL_x, m_long) # 边界损失权重
+            )/ 3
+
+            # loss_x_trans = (criterion_seg_ce(segT_x, m_trans) +
+            #                 criterion_seg_dice(segT_x, m_trans, softmax=True, ignore=torch.zeros_like(m_trans))) / 2.0
+
+            loss_x_trans = (
+                    criterion_seg_ce(segT_x, m_trans) +
+                    criterion_seg_dice(segT_x, m_trans, softmax=True, ignore=torch.zeros_like(m_trans)) +
+                    criterion_boundary(segT_x, m_trans)
+            )/ 3
             loss_x_seg = (loss_x_long + loss_x_trans) / 2.0
 
             # labeled cls loss (fused cls_x already)
@@ -388,11 +429,29 @@ def train_one_epoch(
                             + criterion_cls_mse(torch.sigmoid(cls_s2m), torch.sigmoid(cls_wm))) / 2.0
 
             # total loss (keep your original weights)
+            # loss = (
+            #     loss_x_seg + loss_x_cls
+            #     + loss_u_s_seg * 0.5            # = 0.25(s1)+0.25(s2) after averaging
+            #     + loss_u_w_fp_seg * 0.5
+            #     + loss_u_s_cls * 0.1
+            # )
+
+            # 【修改点 2：方案三 - 动态权重课程学习】
+            # 使用更保守的分类权重
+            if epoch < 20:
+                cls_weight = 0.1  # 早期分类权重很低
+            elif epoch < 40:
+                cls_weight = 0.3  # 中期适度增加
+            else:
+                cls_weight = 0.5
+
+            # 重新组合总 Loss
             loss = (
-                loss_x_seg + loss_x_cls
-                + loss_u_s_seg * 0.5            # = 0.25(s1)+0.25(s2) after averaging
-                + loss_u_w_fp_seg * 0.5
-                + loss_u_s_cls * 0.1
+                    loss_x_seg +
+                    loss_x_cls * cls_weight +  # 动态增加有监督分类权重
+                    loss_u_s_seg * 0.5 +
+                    loss_u_w_fp_seg * 0.5 +
+                    loss_u_s_cls * (cls_weight * 0.5)  # 无监督分类一致性也随之动态增加
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -689,17 +748,24 @@ def get_model(args):
       - 'UNet'     -> UNetTwoView(...)
     """
     if args.model == "Echocare":
-        model = Echocare_UniMatch(
+        model = OptimizedEchocare_UniMatch(
             in_chns=1,
             seg_class_num=args.seg_num_classes,
             cls_class_num=args.cls_num_classes,
             encoder_pth=args.echo_care_ckpt,
         )
-    elif args.model == "UNet":
-        model = UNetTwoView(
+        # model = Echocare_UniMatch(
+        #     in_chns=1,
+        #     seg_class_num=args.seg_num_classes,
+        #     cls_class_num=args.cls_num_classes,
+        #     encoder_pth=args.echo_care_ckpt,
+        # )
+    elif args.model == "ConvNeXt":  # 新增适配逻辑
+        model = ConvNeXt_UniMatch(
             in_chns=1,
             seg_class_num=args.seg_num_classes,
             cls_class_num=args.cls_num_classes,
+            encoder_pth=args.convnext_ckpt,
         )
     else:
         raise ValueError(f"Unknown model choice: {args.model}")

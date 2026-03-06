@@ -7,7 +7,9 @@ import torch
 import torch.nn.functional as F
 
 from model.Echocare import Echocare_UniMatch
-
+from model.echocare_enhanced import EnhancedEchocare_UniMatch
+from model.echocare_optimized import OptimizedEchocare_UniMatch
+from model.convnext import ConvNeXt_UniMatch
 
 class ValH5Dataset:
     """Simple dataset to iterate over val image .h5 files.
@@ -99,6 +101,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory under val (default: val/output)")
     parser.add_argument("--resize-target", type=int, default=256, help="Resize input short side used during training")
     parser.add_argument("--gpu", type=str, default="0", help="CUDA device id")
+    parser.add_argument("--convnext-ckpt", type=str, default="./pretrain/convnext_tiny_22k_1k_224.pth",
+                        help="Path to ConvNeXt pretrained weights")
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -113,8 +117,18 @@ def main():
     ds = ValH5Dataset(images_dir)
 
     # build model (Echocare)
-    model = Echocare_UniMatch(in_chns=1, seg_class_num=3, cls_class_num=1, encoder_pth=args.encoder_pth)
+    # model = OptimizedEchocare_UniMatch(in_chns=1, seg_class_num=3, cls_class_num=1, encoder_pth=args.encoder_pth)
+    # model = model.to(device)
+    # print(f"Using OptimizedEchocare_UniMatch")
+
+    model = ConvNeXt_UniMatch(
+        in_chns=1,
+        seg_class_num=3,
+        cls_class_num=1,
+        encoder_pth=args.convnext_ckpt  # 注意这里需要传入 convnext 的预训练权重路径
+    )
     model = model.to(device)
+    print(f"Using ConvNeXt_UniMatch")
 
     # load checkpoint
     if not os.path.exists(args.checkpoint):
