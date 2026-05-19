@@ -18,19 +18,20 @@ from dataset.csv import CSVSemiDataset
 from util.utils import AverageMeter, count_params, DiceLoss, compute_nsd
 
 from model.Echocare import Echocare_UniMatch
-from model.echocare_optimized import OptimizedEchocare_UniMatch
 from model.convnext import ConvNeXt_UniMatch
+from model.unet import UNetTwoView
+from model.transUnetUnimatchv2 import TransUnet_UniMatch
 
 def main():
     parser = argparse.ArgumentParser("UniMatch Two-View Training")
-    parser.add_argument("--train-labeled-json", type=str, default="./data/train_labeled.json")
-    parser.add_argument("--train-unlabeled-json", type=str, default="./data/train_unlabeled.json")
-    parser.add_argument("--valid-labeled-json", type=str, default="./data/valid.json")
+    # parser.add_argument("--train-labeled-json", type=str, default="./data/train_labeled.json")
+    # parser.add_argument("--train-unlabeled-json", type=str, default="./data/train_unlabeled.json")
+    # parser.add_argument("--valid-labeled-json", type=str, default="./data/valid.json")
 
     parser.add_argument("--train_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--base_lr", type=float, default=0.0001)
-    parser.add_argument("--conf_thresh", type=float, default=0.9)
+    parser.add_argument("--conf_thresh", type=float, default=0.7)
     parser.add_argument("--seg_num_classes", type=int, default=3)
     parser.add_argument("--cls_num_classes", type=int, default=1)
     parser.add_argument("--resize_target", type=int, default=256)
@@ -38,32 +39,61 @@ def main():
     parser.add_argument("--echo_care_ckpt", type=str, default="./pretrain/echocare_encoder.pth")
     parser.add_argument("--convnext_ckpt", type=str, default="./pretrain/convnext_tiny_22k_1k_224.pth",
                         help="Path to ConvNeXt pretrained weights")
+    parser.add_argument("--transunet_ckpt", type=str, default="./pretrain/vit_b_16-c867db91.pth",
+                        help="Path to ViT pretrained weights for TransUnet")
     parser.add_argument('--amp', type=bool, default=True, help='enable torch.cuda.amp')
     parser.add_argument('--amp-dtype', type=str, default='fp16', choices=['fp16', 'bf16'])
 
     # model choice: Echocare (SwinUNETR-based) or UNet
     # parser.add_argument("--model", type=str, default="Echocare", choices=["Echocare", "UNet"],
     #                     help="Model architecture to use: 'Echocare' or 'UNet'")
-    parser.add_argument("--model", type=str, default="Echocare",
-                        choices=["Echocare", "UNet", "ConvNeXt","SwinUNet"],  # 新增 ConvNeXt
-                        help="Model architecture to use: 'Echocare', 'UNet', 'ConvNeXt', 'SwinUNet'")
+    parser.add_argument("--model", type=str, default="UNet",
+                        choices=["Echocare", "UNet", "ConvNeXt","SwinUNet","TransUnet"],  # 新增 ConvNeXt
+                        help="Model architecture to use: 'Echocare', 'UNet', 'ConvNeXt', 'SwinUNet','TransUnet'")
 
-    parser.add_argument("--save_path", type=str, default="./checkpoints")
+    # parser.add_argument("--save_path", type=str, default="./checkpoints")
+    # 建议改为带fold信息的路径：
+    parser.add_argument("--save_path", type=str, default="./checkpoints",
+                        help="Base checkpoint directory")
+
     parser.add_argument("--gpu", type=str, default="3")
     parser.add_argument("--num_workers", type=int, default=8)
+
+    parser.add_argument("--fold", type=int, default=0, help="Which fold to train (0 to n_folds-1)")
+    parser.add_argument("--data_root", type=str, default="./data", help="Root directory containing fold_X folders")
 
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    logger = build_logger(args.save_path)
+    # 改为动态构建：
+    fold_dir = os.path.join(args.data_root, f"fold_{args.fold}")
+    train_labeled_json = os.path.join(fold_dir, "train_labeled.json")
+    train_unlabeled_json = os.path.join(fold_dir, "train_unlabeled.json")
+    valid_json = os.path.join(fold_dir, "valid.json")
+
+    # 检查文件是否存在
+    for f in [train_labeled_json, train_unlabeled_json, valid_json]:
+        if not os.path.exists(f):
+            raise FileNotFoundError(f"Required file not found: {f}")
+
+    # 然后传给CSVSemiDataset时使用这些路径
+    db_train_u = CSVSemiDataset(train_unlabeled_json, "train_u", size=args.resize_target)
+    db_train_l = CSVSemiDataset(train_labeled_json, "train_l", size=args.resize_target,
+                                n_sample=len(db_train_u.case_list))
+    db_valid_l = CSVSemiDataset(valid_json, "valid")
+
+    actual_save_path = os.path.join(args.save_path, f"fold_{args.fold}")
+    os.makedirs(actual_save_path, exist_ok=True)
+
+    logger = build_logger(actual_save_path)
     logger.info(str(args))
 
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    tb_logdir = os.path.join(args.save_path, "tensorboard")
+    tb_logdir = os.path.join(actual_save_path, "tensorboard")
     os.makedirs(tb_logdir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_logdir)
 
@@ -80,9 +110,9 @@ def main():
     amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
     scaler = torch.amp.GradScaler(enabled=use_amp and (amp_dtype == torch.float16))
     
-    db_train_u = CSVSemiDataset(args.train_unlabeled_json, "train_u", size=args.resize_target)
-    db_train_l = CSVSemiDataset(args.train_labeled_json, "train_l", size=args.resize_target, n_sample=len(db_train_u.case_list))
-    db_valid_l = CSVSemiDataset(args.valid_labeled_json, "valid")
+    # db_train_u = CSVSemiDataset(args.train_unlabeled_json, "train_u", size=args.resize_target)
+    # db_train_l = CSVSemiDataset(args.train_labeled_json, "train_l", size=args.resize_target, n_sample=len(db_train_u.case_list))
+    # db_valid_l = CSVSemiDataset(args.valid_labeled_json, "valid")
 
     train_loader_l = DataLoader(db_train_l, batch_size=args.batch_size, shuffle=True,
                                 num_workers=args.num_workers, drop_last=True)
@@ -100,7 +130,7 @@ def main():
     start_epoch = 0
     previous_best_seg = 0.0
     previous_best_cls = 0.0
-    latest_ckpt = os.path.join(args.save_path, "latest.pth")
+    latest_ckpt = os.path.join(actual_save_path, "latest.pth")
     if os.path.exists(latest_ckpt):
         ckpt = torch.load(latest_ckpt, map_location="cpu")
         model.load_state_dict(ckpt["model"])
@@ -172,13 +202,13 @@ def main():
         }
         torch.save(ckpt, latest_ckpt)
         if is_best:
-            torch.save(ckpt, os.path.join(args.save_path, "best.pth"))
+            torch.save(ckpt, os.path.join(actual_save_path, "best.pth"))
             logger.info(f"New best! total_score={total_score:.2f} saved to best.pth")
         if is_best_seg:
-            torch.save(ckpt, os.path.join(args.save_path, "best_seg.pth"))
+            torch.save(ckpt, os.path.join(actual_save_path, "best_seg.pth"))
             logger.info(f"New best segmentation! seg_score={seg_score:.4f} saved to best_seg.pth")
         if is_best_cls:
-            torch.save(ckpt, os.path.join(args.save_path, "best_cls.pth"))
+            torch.save(ckpt, os.path.join(actual_save_path, "best_cls.pth"))
             logger.info(f"New best classification! cls_score={cls_score:.4f} saved to best_cls.pth")
         # always save latest previous_best values into latest_ckpt for resume
         ckpt["previous_best_seg"] = previous_best_seg
@@ -439,11 +469,11 @@ def train_one_epoch(
             # 【修改点 2：方案三 - 动态权重课程学习】
             # 使用更保守的分类权重
             if epoch < 20:
-                cls_weight = 0.1  # 早期分类权重很低
+                cls_weight = 0.3  # 早期分类权重很低
             elif epoch < 40:
-                cls_weight = 0.3  # 中期适度增加
+                cls_weight = 0.8  # 中期适度增加
             else:
-                cls_weight = 0.5
+                cls_weight = 1.2
 
             # 重新组合总 Loss
             loss = (
@@ -767,6 +797,22 @@ def get_model(args):
             cls_class_num=args.cls_num_classes,
             encoder_pth=args.convnext_ckpt,
         )
+    elif args.model == "UNet":  # 新增 UNet 分支
+        model = UNetTwoView(
+            in_chns=1,
+            seg_class_num=args.seg_num_classes,
+            cls_class_num=args.cls_num_classes,
+        )
+    elif args.model == "TransUnet":  # 新增 TransUnet 分支
+        model = TransUnet_UniMatch(
+            in_chns=1,
+            seg_class_num=args.seg_num_classes,
+            cls_class_num=args.cls_num_classes,
+            base_channels=64,
+            embed_dim=768
+        )
+        if args.transunet_ckpt and os.path.exists(args.transunet_ckpt):
+            model.encoder.load_pretrained_transformer(args.transunet_ckpt)
     else:
         raise ValueError(f"Unknown model choice: {args.model}")
     return model
