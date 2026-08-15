@@ -412,6 +412,19 @@ def convnext_tiny_unimatch(**kwargs):
     return model
 
 
+def get_intermediate_features(self, x):
+    """返回中间层特征用于 GradCAM"""
+    features = self.encoder(x)
+
+    # 返回命名特征字典
+    return {
+        'stage0': features[0],  # [B, 96, H/4, W/4]
+        'stage1': features[1],  # [B, 192, H/8, W/8]
+        'stage2': features[2],  # [B, 384, H/16, W/16]
+        'stage3': features[3],  # [B, 768, H/32, W/32]
+    }
+
+
 if __name__ == '__main__':
     # Test Code
     model = ConvNeXt_UniMatch(in_chns=1, seg_class_num=3, cls_class_num=1)
