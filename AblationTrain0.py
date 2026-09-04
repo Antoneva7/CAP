@@ -20,6 +20,7 @@ from util.utils import AverageMeter, count_params, DiceLoss, compute_nsd
 from model.Echocare import Echocare_UniMatch
 from model.unet import UNetTwoView
 from model.convnext import ConvNeXt_UniMatch
+from model.CascadedUnimatchv3 import CascadedUniMatch
 
 def main():
     parser = argparse.ArgumentParser("UniMatch Two-View Training")
@@ -42,8 +43,8 @@ def main():
     parser.add_argument('--amp', type=bool, default=True, help='enable torch.cuda.amp')
     parser.add_argument('--amp-dtype', type=str, default='fp16', choices=['fp16', 'bf16'])
 
-    parser.add_argument("--model", type=str, default="ConvNeXt", choices=["Echocare", "UNet", "ConvNeXt"],
-                        help="Model architecture to use: 'Echocare', 'UNet', or 'ConvNeXt'")
+    parser.add_argument("--model", type=str, default="ConvNeXt", choices=["Echocare", "UNet", "ConvNeXt", "Cascaded"],
+                        help="Model architecture to use: 'Echocare', 'UNet', 'ConvNeXt', or 'Cascaded'")
 
     parser.add_argument("--save_path", type=str, default="./checkpoints")
     parser.add_argument("--gpu", type=str, default="3")
@@ -599,45 +600,25 @@ def validate(args, model, valid_loader, device, logger, writer=None, epoch=None)
             dice_trans[cls] += diceT
 
             # ---------- NSD ----------
-            # predL_np = (predL[0] == cls).cpu().numpy()
-            # gtL_np = (m_long[0] == cls).cpu().numpy()
-            # nsd_long[cls] += compute_nsd(predL_np, gtL_np, tolerance=3.0)
-            #
-            # predT_np = (predT[0] == cls).cpu().numpy()
-            # gtT_np = (m_trans[0] == cls).cpu().numpy()
-            # nsd_trans[cls] += compute_nsd(predT_np, gtT_np, tolerance=3.0)
-            # 之前的NSD计算没有正确处理batch维度
-            for b in range(batch_size):
-                predL_np_b = (predL[b] == cls).cpu().numpy()
-                gtL_np_b = (m_long[b] == cls).cpu().numpy()
-                nsd_long[cls] += compute_nsd(predL_np_b, gtL_np_b, tolerance=3.0)
+            predL_np = (predL[0] == cls).cpu().numpy()
+            gtL_np = (m_long[0] == cls).cpu().numpy()
+            nsd_long[cls] += compute_nsd(predL_np, gtL_np, tolerance=3.0)
 
-                predT_np_b = (predT[b] == cls).cpu().numpy()
-                gtT_np_b = (m_trans[b] == cls).cpu().numpy()
-                nsd_trans[cls] += compute_nsd(predT_np_b, gtT_np_b, tolerance=3.0)
-
+            predT_np = (predT[0] == cls).cpu().numpy()
+            gtT_np = (m_trans[0] == cls).cpu().numpy()
+            nsd_trans[cls] += compute_nsd(predT_np, gtT_np, tolerance=3.0)
 
     # -------------------------
     # segmentation 结果
     # -------------------------
     idx_to_name = {1:"Plaque", 2:"Vessel"}
-    # for cls in [1, 2]:
-    #     dice_long[cls] = dice_long[cls] / max(1, num_batches)
-    #     dice_trans[cls] = dice_trans[cls] / max(1, num_batches)
-    #     logger.info(f"[Dice] {idx_to_name[cls]} | Long Dice: {dice_long[cls]:.2f} | Trans Dice: {dice_trans[cls]:.2f}")
-    #
-    #     nsd_long[cls] = nsd_long[cls] / max(1, num_batches)
-    #     nsd_trans[cls] = nsd_trans[cls] / max(1, num_batches)
-    #     logger.info(f"[NSD] {idx_to_name[cls]} | Long NSD: {nsd_long[cls]:.2f} | Trans NSD: {nsd_trans[cls]:.2f}")
-    # 在循环外部归一化时，除以总样本数 total_samples，而不是 num_batches：
-    total_samples = len(valid_loader.dataset)
     for cls in [1, 2]:
-        dice_long[cls] /= total_samples
-        dice_trans[cls] /= total_samples
+        dice_long[cls] = dice_long[cls] / max(1, num_batches)
+        dice_trans[cls] = dice_trans[cls] / max(1, num_batches)
         logger.info(f"[Dice] {idx_to_name[cls]} | Long Dice: {dice_long[cls]:.2f} | Trans Dice: {dice_trans[cls]:.2f}")
 
-        nsd_long[cls] /= total_samples
-        nsd_trans[cls] /= total_samples
+        nsd_long[cls] = nsd_long[cls] / max(1, num_batches)
+        nsd_trans[cls] = nsd_trans[cls] / max(1, num_batches)
         logger.info(f"[NSD] {idx_to_name[cls]} | Long NSD: {nsd_long[cls]:.2f} | Trans NSD: {nsd_trans[cls]:.2f}")
 
     mean_dice = (dice_long[1] + dice_long[2] + dice_trans[1] + dice_trans[2]) / 4.0
@@ -749,6 +730,15 @@ def get_model(args):
             seg_class_num=args.seg_num_classes,
             cls_class_num=args.cls_num_classes,
             encoder_pth=args.convnext_ckpt,
+        )
+    elif args.model == "Cascaded":
+        model = CascadedUniMatch(
+            in_chns=1,
+            seg_class_num=args.seg_num_classes,
+            cls_class_num=args.cls_num_classes,
+            encoder_pth=args.convnext_ckpt,
+            unet_base_ch=32,
+            attn_heads=4,
         )
     else:
         raise ValueError(f"Unknown model choice: {args.model}")
