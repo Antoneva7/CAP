@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset.csv import CSVSemiDataset 
-from util.utils import AverageMeter, count_params, DiceLoss, compute_nsd
+from util.utils import AverageMeter, count_params, DiceLoss, compute_nsd, BoundaryLoss
 
 from model.Echocare import Echocare_UniMatch
 from model.unet import UNetTwoView
@@ -24,16 +24,13 @@ from model.CascadedUnimatchv3 import CascadedUniMatch
 
 def main():
     parser = argparse.ArgumentParser("UniMatch Two-View Training")
-    # parser.add_argument("--train-labeled-json", type=str, default="./data/train_labeled.json")
-    # parser.add_argument("--train-unlabeled-json", type=str, default="./data/train_unlabeled.json")
-    # parser.add_argument("--valid-labeled-json", type=str, default="./data/valid.json")
     parser.add_argument("--fold", type=int, default=0, help="Which fold to train (0 to n_folds-1)")
     parser.add_argument("--data_root", type=str, default="./data", help="Root directory containing fold_X folders")
 
     parser.add_argument("--train_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--base_lr", type=float, default=0.0001)
-    parser.add_argument("--conf_thresh", type=float, default=0.9)
+    parser.add_argument("--conf_thresh", type=float, default=0.7)
     parser.add_argument("--seg_num_classes", type=int, default=3)
     parser.add_argument("--cls_num_classes", type=int, default=1)
     parser.add_argument("--resize_target", type=int, default=256)
@@ -49,6 +46,13 @@ def main():
     parser.add_argument("--save_path", type=str, default="./checkpoints")
     parser.add_argument("--gpu", type=str, default="3")
     parser.add_argument("--num_workers", type=int, default=8)
+
+    parser.add_argument("--use_grad_detach", action="store_true",
+                        help="启用分类梯度截断（前20epoch不回传编码器）")
+    parser.add_argument("--use_boundary", action="store_true",
+                        help="启用边缘损失 BoundaryLoss")
+    parser.add_argument("--use_curriculum", action="store_true",
+                        help="启用分类权重课程学习")
 
     args = parser.parse_args()
 
@@ -276,11 +280,33 @@ def train_one_epoch(
     scaler
 ):
     model.train()
+
+    # ===== 梯度截断（可开关）=====
+    if hasattr(model, 'set_cls_detach'):
+        if args.use_grad_detach:
+            # Cascaded v3 用两阶段：前20epoch冻结分类梯度，之后放开
+            if epoch < 20:
+                model.set_cls_detach(True)
+                if epoch == 0:
+                    logger.info("[Ablation] GradDetach ON: epoch<20, cls grad detached")
+            else:
+                model.set_cls_detach(False)
+                if epoch == 20:
+                    logger.info("[Ablation] GradDetach: epoch>=20, cls grad enabled")
+        else:
+            # 基线：始终放开（等价于不截断）
+            model.set_cls_detach(False)
     
     criterion_cls = nn.BCEWithLogitsLoss()
     criterion_cls_mse = nn.MSELoss()
-    criterion_seg_ce = nn.CrossEntropyLoss()
+    if args.use_weighted_ce:
+        class_weights = torch.tensor([0.1, 5.0, 1.0], device=device)
+        criterion_seg_ce = nn.CrossEntropyLoss(weight=class_weights)
+    else:
+        criterion_seg_ce = nn.CrossEntropyLoss()
     criterion_seg_dice = DiceLoss(n_classes=args.seg_num_classes)
+
+    criterion_boundary = BoundaryLoss() if args.use_boundary else None
 
     total_loss = AverageMeter()
     total_loss_x = AverageMeter()
@@ -374,10 +400,20 @@ def train_one_epoch(
 
             # 6) losses
             # labeled seg loss: long + trans average
-            loss_x_long = (criterion_seg_ce(segL_x, m_long) +
-                        criterion_seg_dice(segL_x, m_long, softmax=True, ignore=torch.zeros_like(m_long))) / 2.0
-            loss_x_trans = (criterion_seg_ce(segT_x, m_trans) +
-                            criterion_seg_dice(segT_x, m_trans, softmax=True, ignore=torch.zeros_like(m_trans))) / 2.0
+            if args.use_boundary:
+                loss_x_long = (criterion_seg_ce(segL_x, m_long)
+                               + criterion_seg_dice(segL_x, m_long, softmax=True, ignore=torch.zeros_like(m_long))
+                               + criterion_boundary(segL_x, m_long)) / 3.0
+                loss_x_trans = (criterion_seg_ce(segT_x, m_trans)
+                                + criterion_seg_dice(segT_x, m_trans, softmax=True, ignore=torch.zeros_like(m_trans))
+                                + criterion_boundary(segT_x, m_trans)) / 3.0
+            else:
+                loss_x_long = (criterion_seg_ce(segL_x, m_long)
+                               + criterion_seg_dice(segL_x, m_long, softmax=True,
+                                                    ignore=torch.zeros_like(m_long))) / 2.0
+                loss_x_trans = (criterion_seg_ce(segT_x, m_trans)
+                                + criterion_seg_dice(segT_x, m_trans, softmax=True,
+                                                     ignore=torch.zeros_like(m_trans))) / 2.0
             loss_x_seg = (loss_x_long + loss_x_trans) / 2.0
 
             # labeled cls loss (fused cls_x already)
@@ -411,11 +447,25 @@ def train_one_epoch(
                             + criterion_cls_mse(torch.sigmoid(cls_s2m), torch.sigmoid(cls_wm))) / 2.0
 
             # total loss (keep your original weights)
+            if args.use_curriculum:
+                # 与 train.py 的非 Cascaded 分支一致（v3 也可先用这个）
+                if epoch < 20:
+                    cls_weight = 0.3
+                elif epoch < 40:
+                    cls_weight = 0.8
+                else:
+                    cls_weight = 1.2
+                extra_cls_weight = cls_weight * 0.5
+            else:
+                cls_weight = 1.0
+                extra_cls_weight = 0.1
+
             loss = (
-                loss_x_seg + loss_x_cls
-                + loss_u_s_seg * 0.5            # = 0.25(s1)+0.25(s2) after averaging
-                + loss_u_w_fp_seg * 0.5
-                + loss_u_s_cls * 0.1
+                    loss_x_seg
+                    + loss_x_cls * cls_weight
+                    + loss_u_s_seg * 0.5
+                    + loss_u_w_fp_seg * 0.5
+                    + loss_u_s_cls * extra_cls_weight
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -451,6 +501,7 @@ def train_one_epoch(
                 f"Loss_fp: {total_loss_fp.avg:.3f} | "
                 f"Loss_extra_cls: {total_loss_extra_cls.avg:.3f} | "
                 f"MaskRatio: {total_mask_ratio.avg:.3f}"
+                f"cls_w: {cls_weight:.2f} | extra_cls_w: {extra_cls_weight:.3f} | "
             )
 
     return {
@@ -682,11 +733,11 @@ def validate(args, model, valid_loader, device, logger, writer=None, epoch=None)
         
         # Note: total_score currently capped around 0.8 locally because the
         # time-efficiency component (20% of total) is not computed in local eval.
-        "total_score": f1 *0.4 +\
-            (dice_long[2] + nsd_long[2])/2 *0.4*0.2 +\
-            (dice_long[1] + nsd_long[1])/2 *0.6*0.2 +\
-            (dice_trans[2] + nsd_trans[2])/2 *0.4*0.2 +\
-            (dice_trans[1] + nsd_trans[1])/2 *0.6*0.2,
+        "total_score": f1 *0.5 +\
+            (dice_long[2] + nsd_long[2])/2 *0.4*0.25 +\
+            (dice_long[1] + nsd_long[1])/2 *0.6*0.25 +\
+            (dice_trans[2] + nsd_trans[2])/2 *0.4*0.25 +\
+            (dice_trans[1] + nsd_trans[1])/2 *0.6*0.25,
     }
 
 def build_logger(save_path: str):

@@ -20,15 +20,10 @@ from util.utils import AverageMeter, count_params, DiceLoss, compute_nsd
 from model.Echocare import Echocare_UniMatch
 from model.convnext import ConvNeXt_UniMatch
 from model.unet import UNetTwoView
-from model.transUnetUnimatchv2 import TransUnet_UniMatch
 from model.CascadedUnimatchv3 import CascadedUniMatch
 
 def main():
     parser = argparse.ArgumentParser("UniMatch Two-View Training")
-    # parser.add_argument("--train-labeled-json", type=str, default="./data/train_labeled.json")
-    # parser.add_argument("--train-unlabeled-json", type=str, default="./data/train_unlabeled.json")
-    # parser.add_argument("--valid-labeled-json", type=str, default="./data/valid.json")
-
     parser.add_argument("--train_epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--base_lr", type=float, default=0.0001)
@@ -44,16 +39,10 @@ def main():
                         help="Path to ViT pretrained weights for TransUnet")
     parser.add_argument('--amp', type=bool, default=True, help='enable torch.cuda.amp')
     parser.add_argument('--amp-dtype', type=str, default='fp16', choices=['fp16', 'bf16'])
-
-    # model choice: Echocare (SwinUNETR-based) or UNet
-    # parser.add_argument("--model", type=str, default="Echocare", choices=["Echocare", "UNet"],
-    #                     help="Model architecture to use: 'Echocare' or 'UNet'")
     parser.add_argument("--model", type=str, default="UNet",
-                        choices=["Echocare", "UNet", "ConvNeXt","SwinUNet","TransUnet","Cascaded"],  # 新增 ConvNeXt
-                        help="Model architecture to use: 'Echocare', 'UNet', 'ConvNeXt', 'SwinUNet','TransUnet'")
+                        choices=["Echocare", "UNet", "ConvNeXt","Cascaded"],
+                        help="Model architecture to use: 'Echocare', 'UNet', 'ConvNeXt','Cascaded'")
 
-    # parser.add_argument("--save_path", type=str, default="./checkpoints")
-    # 建议改为带fold信息的路径：
     parser.add_argument("--save_path", type=str, default="./checkpoints",
                         help="Base checkpoint directory")
 
@@ -68,18 +57,15 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 改为动态构建：
     fold_dir = os.path.join(args.data_root, f"fold_{args.fold}")
     train_labeled_json = os.path.join(fold_dir, "train_labeled.json")
     train_unlabeled_json = os.path.join(fold_dir, "train_unlabeled.json")
     valid_json = os.path.join(fold_dir, "valid.json")
 
-    # 检查文件是否存在
     for f in [train_labeled_json, train_unlabeled_json, valid_json]:
         if not os.path.exists(f):
             raise FileNotFoundError(f"Required file not found: {f}")
 
-    # 然后传给CSVSemiDataset时使用这些路径
     db_train_u = CSVSemiDataset(train_unlabeled_json, "train_u", size=args.resize_target)
     db_train_l = CSVSemiDataset(train_labeled_json, "train_l", size=args.resize_target,
                                 n_sample=len(db_train_u.case_list))
@@ -110,10 +96,6 @@ def main():
     use_amp = args.amp and (device.type == "cuda")
     amp_dtype = torch.float16 if args.amp_dtype == "fp16" else torch.bfloat16
     scaler = torch.amp.GradScaler(enabled=use_amp and (amp_dtype == torch.float16))
-    
-    # db_train_u = CSVSemiDataset(args.train_unlabeled_json, "train_u", size=args.resize_target)
-    # db_train_l = CSVSemiDataset(args.train_labeled_json, "train_l", size=args.resize_target, n_sample=len(db_train_u.case_list))
-    # db_valid_l = CSVSemiDataset(args.valid_labeled_json, "valid")
 
     train_loader_l = DataLoader(db_train_l, batch_size=args.batch_size, shuffle=True,
                                 num_workers=args.num_workers, drop_last=True)
@@ -290,12 +272,8 @@ def train_one_epoch(
 ):
     model.train()
 
-    # ============= 改动点4：动态控制分类梯度回传 =============
-    # 前20个epoch分类梯度不回传到编码器（专注于分割）
-    # 20个epoch后允许分类梯度更新编码器
     if hasattr(model, 'set_cls_detach'):
         if args.model == "Cascaded":
-            # 渐进式梯度开放策略（仅对 Cascade 模型生效）
             if epoch < 20:
                 model.set_cls_detach(True)
                 if epoch == 0:
@@ -310,18 +288,6 @@ def train_one_epoch(
                 if epoch == 50:
                     logger.info(
                         "[Cascaded] Phase 3 (50-100): Stage1 frozen again, focusing on classification convergence")
-        elif args.model == "Cascadedv2.1":
-            if epoch < 15:
-                # 前10个epoch：冻结stage2梯度（只训练血管分割）
-                model.set_cls_detach(True)
-                if epoch == 0:
-                    logger.info("[Cascaded] Phase 1 (0-10): Stage2 frozen, training vessel segmentation only")
-            else:
-                # 10个epoch后：一直联合优化，不再冻结
-                model.set_cls_detach(False)
-                if epoch == 15:
-                    logger.info(
-                        "[Cascaded] Phase 2 (10+): End-to-end joint optimization, Stage2 gradients update Stage1")
         else:
             if epoch < 20:
                 model.set_cls_detach(True)
@@ -335,8 +301,6 @@ def train_one_epoch(
     criterion_cls = nn.BCEWithLogitsLoss()
     criterion_cls_mse = nn.MSELoss()
 
-    # 【修改点 1：方案二 - 加权 CE Loss】
-    # 0:背景(0.1), 1:斑块(5.0), 2:血管(1.0) -> 重点关注斑块
     class_weights = torch.tensor([0.1, 5.0, 1.0]).to(device)
     criterion_seg_ce = nn.CrossEntropyLoss(weight=class_weights)
 
@@ -344,9 +308,6 @@ def train_one_epoch(
     criterion_boundary = BoundaryLoss()
 
     criterion_seg_dice = DiceLoss(n_classes=args.seg_num_classes)
-
-    # criterion_seg_ce = nn.CrossEntropyLoss()
-    # criterion_seg_dice = DiceLoss(n_classes=args.seg_num_classes)
 
     total_loss = AverageMeter()
     total_loss_x = AverageMeter()
@@ -438,18 +399,11 @@ def train_one_epoch(
             maskT_cm1, confT_cm1 = cutmix_apply_pseudo(maskT_w, confT_w, maskT_wm, confT_wm, boxT1)
             maskT_cm2, confT_cm2 = cutmix_apply_pseudo(maskT_w, confT_w, maskT_wm, confT_wm, boxT2)
 
-            # 6) losses
-            # labeled seg loss: long + trans average
-            # loss_x_long = (criterion_seg_ce(segL_x, m_long) +
-            #             criterion_seg_dice(segL_x, m_long, softmax=True, ignore=torch.zeros_like(m_long))) / 2.0
             loss_x_long = (
                     criterion_seg_ce(segL_x, m_long) +
                     criterion_seg_dice(segL_x, m_long, softmax=True, ignore=torch.zeros_like(m_long)) +
                     criterion_boundary(segL_x, m_long) # 边界损失权重
             )/ 3
-
-            # loss_x_trans = (criterion_seg_ce(segT_x, m_trans) +
-            #                 criterion_seg_dice(segT_x, m_trans, softmax=True, ignore=torch.zeros_like(m_trans))) / 2.0
 
             loss_x_trans = (
                     criterion_seg_ce(segT_x, m_trans) +
@@ -458,11 +412,8 @@ def train_one_epoch(
             )/ 3
             loss_x_seg = (loss_x_long + loss_x_trans) / 2.0
 
-            # labeled cls loss (fused cls_x already)
-            # ensure y_cls is [B,1] float and apply BCEWithLogitsLoss on logits
             loss_x_cls = criterion_cls(cls_x, y_cls.float())
 
-            # unlabeled strong seg loss (Dice on pseudo) - average across (view,long/trans) and (s1/s2)
             ignL1 = (confL_cm1 < args.conf_thresh).float()
             ignL2 = (confL_cm2 < args.conf_thresh).float()
             ignT1 = (confT_cm1 < args.conf_thresh).float()
@@ -488,52 +439,29 @@ def train_one_epoch(
             loss_u_s_cls = (criterion_cls_mse(torch.sigmoid(cls_s1m), torch.sigmoid(cls_wm))
                             + criterion_cls_mse(torch.sigmoid(cls_s2m), torch.sigmoid(cls_wm))) / 2.0
 
-            # total loss (keep your original weights)
-            # loss = (
-            #     loss_x_seg + loss_x_cls
-            #     + loss_u_s_seg * 0.5            # = 0.25(s1)+0.25(s2) after averaging
-            #     + loss_u_w_fp_seg * 0.5
-            #     + loss_u_s_cls * 0.1
-            # )
-
-            # 【修改点 2：方案三 - 动态权重课程学习】
             if args.model == "Cascaded":
                 if epoch < 20:
-                    cls_weight = 0.2  # 早期分类权重很低
+                    cls_weight = 0.2
                 elif epoch < 50:
-                    cls_weight = 0.4  # 中期适度增加
+                    cls_weight = 0.4
                 else:
                     cls_weight = 1.0
                 extra_cls_weight = cls_weight * 0.5
-            elif args.model == "Cascadedv2.1":
-                if epoch < 15:
-                    cls_weight = 0.1  # 前10个epoch无分类损失
-                elif epoch < 20:
-                    cls_weight = 0.2  # 中期适度增加
-                elif epoch < 25:
-                    cls_weight = 0.3
-                elif epoch < 30:
-                    cls_weight = 0.4
-                else:
-                    cls_weight = 0.5
-                extra_cls_weight = cls_weight * 0.5
             else:
-                # 使用更保守的分类权重
                 if epoch < 20:
-                    cls_weight = 0.3  # 早期分类权重很低
+                    cls_weight = 0.3
                 elif epoch < 40:
-                    cls_weight = 0.8  # 中期适度增加
+                    cls_weight = 0.8
                 else:
                     cls_weight = 1.2
                 extra_cls_weight = cls_weight * 0.5
 
-            # 重新组合总 Loss
             loss = (
                     loss_x_seg +
-                    loss_x_cls * cls_weight +  # 动态增加有监督分类权重
+                    loss_x_cls * cls_weight +
                     loss_u_s_seg * 0.5 +
                     loss_u_w_fp_seg * 0.5 +
-                    loss_u_s_cls * extra_cls_weight  # 无监督分类一致性也随之动态增加
+                    loss_u_s_cls * extra_cls_weight
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -836,35 +764,19 @@ def get_model(args):
             cls_class_num=args.cls_num_classes,
             encoder_pth=args.echo_care_ckpt,
         )
-        # model = Echocare_UniMatch(
-        #     in_chns=1,
-        #     seg_class_num=args.seg_num_classes,
-        #     cls_class_num=args.cls_num_classes,
-        #     encoder_pth=args.echo_care_ckpt,
-        # )
-    elif args.model == "ConvNeXt":  # 新增适配逻辑
+    elif args.model == "ConvNeXt":
         model = ConvNeXt_UniMatch(
             in_chns=1,
             seg_class_num=args.seg_num_classes,
             cls_class_num=args.cls_num_classes,
             encoder_pth=args.convnext_ckpt,
         )
-    elif args.model == "UNet":  # 新增 UNet 分支
+    elif args.model == "UNet":
         model = UNetTwoView(
             in_chns=1,
             seg_class_num=args.seg_num_classes,
             cls_class_num=args.cls_num_classes,
         )
-    elif args.model == "TransUnet":  # 新增 TransUnet 分支
-        model = TransUnet_UniMatch(
-            in_chns=1,
-            seg_class_num=args.seg_num_classes,
-            cls_class_num=args.cls_num_classes,
-            base_channels=64,
-            embed_dim=768
-        )
-        if args.transunet_ckpt and os.path.exists(args.transunet_ckpt):
-            model.encoder.load_pretrained_transformer(args.transunet_ckpt)
     elif args.model == "Cascaded":
         model = CascadedUniMatch(
             in_chns=1,
